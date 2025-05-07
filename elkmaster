@@ -1,0 +1,1108 @@
+#!/bin/bash
+# Redigé par BONORA Bastien
+# Le but est de pouvoir administrer ce serveur sans problème.
+# ------------------ EDITION DES FICHIERS ----------------------
+# L'édition des fichiers peut directement se faire depuis ce script en toute sécurité.
+# Une copie du  fichier que l'on veut éditer se fait automatiquement lorsque l'on
+# veut modifier un fichier quel qu'il soit.
+# ------------------ RESTORATION DES FICHIERS ------------------
+# ce script permet également de restaurer un fichier de configuration que l'on souhaite 
+# dans le répertoire du service concerné (celui du service).
+# Il faut uniquement le renommer et redémarrer le service.
+
+
+
+
+###########################################################
+# DECLARATION DES COULEURS
+###########################################################
+
+# Les couleurs peuvent être utilisées pour ajouter de la coloration syntaxique.
+# Utilisation :
+# fprintf "${Nom de la couleur} [le texte que vous voulez colorer] ${NONE}"
+##########################################################################
+############## BIEN UTILISER LES "{}" LORS DE L'UTILISATION DES COULEURS #
+NONE="\033[m"
+WHITE="\033[1;37m"
+GREEN="\033[1;32m"
+RED="\033[0;32;31m"
+YELLOW="\033[1;33m"
+BLUE="\033[34m"
+CYAN="\033[36m"
+LIGHT_GREEN="\033[1;32m"
+LIGHT_RED="\033[1;31m"
+PURPLE="\033[35m"
+
+# Variables où sont stockées les sauvegardes des configurations des services d'ELK.
+KIBANA_SAVE_PATH="/home/public/.elkmaster/kibana/"
+ELASTIC_SAVE_PATH="/home/public/.elkmaster/elastic/"
+FILEBEAT_SAVE_PATH="/home/public/.elkmaster/filebeat/"
+
+# URL attendues lors de téléchargement de deb d'ELK : 
+ELASTIC_DEB_URL="https://artifacts.elastic.co/downloads/elasticsearch/"
+KIBANA_DEB_URL="https://artifacts.elastic.co/downloads/kibana/"
+FILEBEAT_DEB_URL="https://artifacts.elastic.co/downloads/beats/filebeat/"
+
+###########################################################
+# DECLARATION DES FONCTIONS DU SCRIPT
+###########################################################
+
+function check_internet () {
+# Fonction permettant de rapidement tester l'accès internet.
+	/usr/bin/ping -c 4 8.8.8.8 > /dev/null 2>&1 # envoi 4 paquets, redirige la sortie vers /dev/null
+	if [ $? -eq 0 ]; then
+		fprintf "${GREEN}Accès internet fonctionnel${NONE}"
+		return 0
+	else 
+		fprintf "${RED}Aucun accès internet, impossible de continuer${NONE}"
+		return 1
+	fi	
+}
+
+function fprintf () {
+# Fonction permettant de simplifier l'utiliastion de printf de manière sécurisée (pas d'utilisation du PATH dans le script).
+	/usr/bin/printf "%b\n" "$1$2"
+}
+
+function validate_url () {
+# Fonction permettant de valider les URL fournies par les admins lors de la mise à jour du serveur	
+	local url="$1"
+	local expected_prefix="$2"
+	# Vérification à la fois de la présente de l'URL correcte ainsi que de l'extension .deb des fichiers.
+	if [[ "$url" =~ "$expected_prefix" ]] && [[ "$url" =~ \.deb$ ]]; then
+		fprintf "${GREEN}L'URL fournie semble valide : $url${NONE}"
+		return 0
+	else
+		fprintf "${RED}Erreur : L'URL ne semble pas correspondre, le préfixe attendu est le suivant : $expected_prefix${NONE}"
+		return 1
+	fi
+}
+
+function download_package() {
+# Fonction permettant de récupérer les packages de mise à jour
+	local url="$1"
+	local filename=$(basename "$url") # Extraire le nom du fichier directement depuis l'url
+
+	fprintf "[${CYAN}DebFile${NONE}] - téléchargement de : ${GREEN}$filename${NONE}\n"
+	curl -o "/home/public/update/versionFiles/$filename" "$url"
+
+	if [ $? -eq 0 ]; then
+		fprintf "${GREEN}Téléchargement réussi de $filename${NONE}\n"
+		return 0
+	else
+		fprintf "${RED}Echec du téléchargement de $filename${NONE}\n"
+		return 1
+	fi
+}
+
+function check_service () {
+# Fonction permettant de vérifier le statud d'un service. Renvera le status 0 si le service est actif.
+	local serviceName="$1"
+	local expectedState="${2:-active}" # Valeur par défaut dans le second argument = "active"
+	local isActive=$(/usr/bin/systemctl is-active "$serviceName")
+	if [ $isActive = "$expectedState" ]; then
+		return 0
+	else 
+		return 1
+	fi
+}
+
+function update_services () {
+	local backup_dir="/home/public/update_services/versionFiles"
+	if [ ! -z $1 ]
+	then
+		if [ $1 = "all" ]
+		# Condition si jamais on veut mettre à jour tous les services en une seule fois
+		then
+			fprintf "Avant de commencer, veuillez vous munir des éléments suivants : \n     1. Les ${BLUE}urls${NONE} des fichiers .deb à télécharger pour les services suivants : ${PURPLE}elasticsearch, filebeat, kibana${NONE}\n     2. Avoir activé la règle 692 dans le pare-feu pour l'accès internet de ce serveur."
+			/usr/bin/sleep 4
+			fprintf "${LIGHT_GREEN}Veuillez vous référer à la base de connaissance 404${NONE} '[SYSLOG] : administrer le serveur' pour toute information complémentaire"
+			/usr/bin/sleep 4
+			fprintf "${RED}Avez-vous tous les éléments en main avant de commencer ?${NONE} \n(Oui:O Non:N)"
+			read prerequisites
+			if [ $prerequisites = "O" ]
+			then
+				fprintf "${CYAN}Commencement de la procédure de mise à jour${NONE}\n"
+				#####################################################################
+				#			   VERIFICATION DE L'ACCES A INTERNET					#
+				#####################################################################
+				fprintf "[${BLUE}internet${NONE}] vérification de l'accès internet en cour"
+				while ! check_internet; do
+					fprintf "${RED}Aucun accès internet trouvé, impossible de continuer${NONE}"
+					fprintf "Voulez-vous réessayer ? (0/N)"
+					read retryInternetCheck
+					if [ "$retryInternetCheck" != "O" ]; then
+						fprintf "${RED}Arrêt de la procédure${NONE}"
+						exit 1
+					fi
+				done
+				#####################################################################
+				#			   VERIFICATION DES DEPOTS D'ELASTIC					#
+				#####################################################################
+				fprintf "\nVeuillez donner l'URL du service ${PURPLE}elasticsearch${NONE} :"
+				read elasticDebUrl # réupérer l'URL du deb de elastic
+				# Vérification de l'URL 
+				while ! validate_url "$elasticDebUrl" "$ELASTIC_DEB_URL"; do
+					fprintf "${RED}L'URL que vous avre fournie ne semble pas valide${NONE}"
+					fprintf "${CYAN}Veuillez rentrer la bonne URL${NONE} ou tapez 'N' pour ${RED}quiter${NONE}"
+					read elasticDebUrl
+					if [ "$elasticDebUrl" = "N" ]; then
+						fprintf "${RED}Arrêt de la procédure${NONE}"
+						exit 1
+					fi
+				done
+
+
+				fprintf "\nVeuillez donner l'URL du service ${PURPLE}kibana${NONE} :"
+				read kibanaDebUrl # réupérer l'URL du deb de kibana
+				# Vérification de l'URL				
+				while ! validate_url "$kibanaDebUrl" "$KIBANA_DEB_URL"; do
+					fprintf "${RED}L'URL que vous avre fournie ne semble pas valide${NONE}"
+					fprintf "${CYAN}Veuillez rentrer la bonne URL${NONE} ou tapez 'N' pour ${RED}quiter${NONE}"
+					read kibanaDebUrl
+					if [ "$kibanaDebUrl" = "N" ]; then
+						fprintf "${RED}Arrêt de la procédure${NONE}"
+						exit 1
+					fi
+				done
+				
+				fprintf "\nVeuillez donner l'URL du service ${PURPLE}filebeat${NONE} :"
+				read filebeatDebUrl # réupérer l'URL du deb de filebeat
+				# Vérification de l'URL				
+				while ! validate_url "$filebeatDebUrl" "$FILEBEAT_DEB_URL"; do
+					fprintf "${RED}L'URL que vous avre fournie ne semble pas valide${NONE}"
+					fprintf "${CYAN}Veuillez rentrer la bonne URL${NONE} ou tapez 'N' pour ${RED}quiter${NONE}"
+					read filebeatDebUrl
+					if [ "$filebeatDebUrl" = "N" ]; then
+						fprintf "${RED}Arrêt de la procédure${NONE}"
+						exit 1
+					fi
+				done
+				# Définition des URLs dans un tableau :
+				urls=(
+					"$elasticDebUrl"
+					"$kibanaDebUrl"
+					"$filebeatDebUrl"
+				)
+
+
+				# Extraction des numéros de version téléchargés
+				for url in "${urls[@]}"; do
+					version=$(echo "$url" | grep -oP "\d+\.\d+\.\d+")
+					versions+=("$version")
+				done
+
+				# Vérification que toutes les versions sont identiques :
+				unique_version=$(echo "${versions[@]}" | tr ' ' '\n' | sort -u)
+
+				if [ "$(echo "$unique_version" | wc -l)" -eq 1 ]; then
+					fprintf "${GREEN}Toutes les versions sont identiques : ${unique_version}${NONE}"
+
+				else
+					fprintf "${RED}[Erreur] - les versions des paquets ne sont pas identiques êtes-vous sûr de vouloir continuer ? [O/N]${NONE}"
+					/usr/bin/read notSameVersion
+					if [ "$notSameVersion" != "O" ]; then
+						fprintf "${RED}Arrêt de la procédure${NONE}"
+						exit 1
+					fi
+				fi
+				
+					#####################################################################
+					#				 TELECHARGEMENT DES FICHIERS DANS LE PUBLIC			#
+					#####################################################################
+				fprintf "Téléchargement du deb d'elasticsearch dans /home/public/update/versionFiles"
+				download_package "$elasticDebUrl"
+
+				fprintf "Téléchargement du deb de kibana dans /home/public/update/versionFiles"
+				download_package "$kibanaDebUrl"
+
+				fprintf "Téléchargement du deb de filebeat dans /home/public/update/versionFiles"
+				download_package "$filebeatDebUrl"
+
+				#####################################################################
+				#				 COPIE DES CONF DANS LE PUBLIC						#
+				#####################################################################
+
+				fprintf "[${BLUE}file${NONE}] - copie des configurations des services ELK"
+				fprintf "${RED}Suppression de la sauvegarde d'elasticsearch${NONE}"
+				/usr/bin/rm -rf /home/public/update/elasticsearch
+				fprintf "[${BLUE}file${NONE}] - copie du dossier de conf ${PURPLE}d'elasticsearch${NONE}"
+				/usr/bin/cp -r /etc/elasticsearch /home/public/update/
+
+				fprintf "${RED}Suppression de la sauvegarde${NONE} de ${PURPLE}kibana${NONE}"
+				/usr/bin/rm -rf /home/public/update/kibana
+				fprintf "[${BLUE}file${NONE}] - copie du dossier de conf ${PURPLE}de kibana${NONE}"
+				/usr/bin/cp -r /etc/kibana /home/public/update/
+
+				fprintf "${RED}Suppression de la sauvegarde de filebeat${NONE}"
+				/usr/bin/rm -rf /home/public/update/filebeat
+				fprintf "[${BLUE}file${NONE}] - copie du dossier de conf ${PURPLE}de filebeat${NONE}"
+				/usr/bin/cp -r /etc/filebeat /home/public/update/
+
+				fprintf "[${BLUE}file${NONE}] - copie des configurations des services ELK ${GREEN}terminée${NONE}"
+				fprintf "[${CYAN}information${NONE}] - vous pouvez retrouver la configuration actuelle des services ELK ici : ${GREEN}/home/public/update/[nom du service]${NONE}"
+
+				fprintf "[${RED}supression${NONE}] - suppression de l'ancienne archive des versions"
+				/usr/bin/rm -f /home/public/update/versionFiles/*.tar
+
+
+				#####################################################################
+				#				 EXTINCTION DES SERVICES ELK						#
+				#####################################################################
+				fprintf "[${RED}system${NONE}] - Arrêt des services avant l'installation de la nouvelle version"
+				fprintf "[${RED}system${NONE}] - Arrêt du service ${PURPLE}elasticsearch${NONE}"
+				stop_service "elasticsearch"
+				while ! check_service "elasticsearch" "inactive"; do
+					fprintf "[${RED}erreur${NONE}] - le service ${PURPLE}elasticsearch${NONE} ne semble pas s'être arrêté"
+					fprintf "Pour continuer, il faut que le service ${PURPLE}elasticsearch${NONE} soit arrêté"
+					fprintf "Voulez-vous lancer la commande ${BLUE}systemctl stop elasticsearch${NONE} pour résoudre le problème ?"
+					fprintf "(O/N)"
+					/usr/bin/read elasticStopServiceChoice
+					if [ $elasticStopServiceChoice != "O" ]; then
+						fprintf "${RED}Arrêt de la procédure, veuillez éteindre le service et réessayer${NONE}"
+						return 1
+					else
+						fprintf "Lancement de la commande ${BLUE}systemctl stop elasticsearch${NONE}"
+						/usr/bin/systemctl stop elasticsearch
+					fi
+				done
+				fprintf "${GREEN}Le service elasticsearch s'est bien arrêté${NONE}"
+				
+				
+
+				fprintf "[${RED}system${NONE}] - Arrêt du service ${PURPLE}kibana${NONE}"
+				stop_service "kibana"
+				while ! check_service "kibana" "inactive"; do
+					fprintf "[${RED}erreur${NONE}] - le service ${PURPLE}kibana${NONE} ne semble pas s'être arrêté"
+					fprintf "Pour continuer, il faut que le service ${PURPLE}kibana${NONE} soit arrêté"
+					fprintf "Voulez-vous lancer la commande ${BLUE}systemctl stop kibana${NONE} pour résoudre le problème ?"
+					fprintf "(O/N)"
+					/usr/bin/read kibanaStopServiceChoice
+					if [ $kibanaStopServiceChoice != "O" ]; then
+						fprintf "${RED}Arrêt de la procédure, veuillez éteindre le service et réessayer${NONE}"
+						return 1
+					else
+						fprintf "Lancement de la commande ${BLUE}systemctl stop kibana${NONE}"
+						/usr/bin/systemctl stop kibana
+					fi
+				done
+				fprintf "${GREEN}Le service Kibana s'est bien arrêté${NONE}"
+
+				fprintf "[${RED}system${NONE}] - Arrêt du service ${PURPLE}filebeat${NONE}"
+				stop_service "filebeat"
+				while ! check_service "filebeat" "inactive"; do
+					fprintf "[${RED}erreur${NONE}] - le service ${PURPLE}filebeat${NONE} ne semble pas s'être arrêté"
+					fprintf "Pour continuer, il faut que le service ${PURPLE}filebeat${NONE} soit arrêté"
+					fprintf "Voulez-vous lancer la commande ${BLUE}systemctl stop filebeat${NONE} pour résoudre le problème ?"
+					fprintf "(O/N)"
+					/usr/bin/read filebeatStopServiceChoice
+					if [ $filebeatStopServiceChoice != "O" ]; then
+						fprintf "${RED}Arrêt de la procédure, veuillez éteindre le service et réessayer${NONE}"
+						return 1
+					else
+						fprintf "Lancement de la commande ${BLUE}systemctl stop filebeat${NONE}"
+						/usr/bin/systemctl stop filebeat
+					fi
+				done
+				fprintf "${GREEN}Le service filebeat s'est bien arrêté${NONE}"
+				fprintf "${GREEN}Les services d'ELK se sont tous bien arrêté${NONE}"
+
+				
+				#####################################################################
+				#				 DEPACKAGING DES PAQUETS TELECHARGES				#
+				#####################################################################
+
+				fprintf "[${BLUE}dpkg${NONE}] - dépaquetage des paquets d'ELK"
+				for deb_file in /home/public/update/versionFiles/*.deb; do
+					fprintf "[${BLUE}dpkg${NONE}] - Dépaquetage du paquet ${PURPLE}$(basename $deb_file)${NONE}"
+					/usr/bin/dpkg -i "$deb_file"
+				done
+
+				# Compression des .deb après avoir tout installé.
+				archive_name="${backup_dir}/ELK_${version}.tar"
+				files_to_tar="${backup_dir}/*.deb"
+				version=$(ls "$deb_files_dir"/*.deb | head -n 1 | grep -oP "\d+\.\d+\.\d+")
+				/usr/bin/tar -czvf "$archive_name" -C "$files_to_tar"
+				if [ $? -eq 0 ]; then
+					fprintf "[${GREEN}Archive${NONE}] - Archive correctement crée : ${BLUE}${archive_name}${NONE}"
+					fprintf "[${RED}Système${NONE}] - Suppression des deb téléchargés"
+					/usr/bin/rm -f /home/public/update/versionFiles/*.deb
+				else
+					fprintf "[${RED}Erreur${NONE}] - erreur lors de la création de l'archive\nVeuillez utiliser la commande ${RED}tar -czvf ${archive_name} -C ${files_to_tar}${NONE} et vérifier si cela fonctionne."
+				fi
+
+				# Finalisation de la mise à jour du système
+				fprintf "[${GREEN}update${NONE}] - ${BLUE}Mise à jour du système en cour${NONE}"
+				/usr/bin/apt update
+				/usr/bin/sleep 2
+				/usr/bin/apt upgrade
+
+				fprintf "[${GREEN}info${NONE}] - ${BLUE}Mise à jour d'ELK terminée${NONE}"
+				fprintf "[${GREEN}Système${NONE}] - Redémarrage de tous les services"
+				start_service "all"
+
+				# La mise à jour du système et de tous les services est donc terminée.
+				
+			else
+				fprintf "${RED}Arrêt de la procédure, vuillez vous munir des éléments cités${NONE}"
+				exit 1 # éteindre le programme avec l'erreur 1 pour la confition anormale
+			fi		
+		fi
+	fi
+}
+
+
+function progression_bar () {
+# Permet d'afficher une barre de proggression d'un élément, on doit simplement lui donner
+# le nombre de secondes que doit durer la barre de progression.
+    local duration=${1:-1} # Durée en secondes, avec une valeur par défaut de 1 si non spécifié
+    local progressionBarSize=$1 # Taille totale de la barre de progression
+    local progressBar=""
+    local spaces=""
+    local progress=0
+    local step=$((progressionBarSize / duration))
+
+    # Initialiser la barre avec des espaces
+    for ((i=0; i<progressionBarSize; i++)); do
+        spaces+=" "
+    done
+
+    # Afficher la progression
+    for ((i=0; i<=duration; i++)); do
+        progressBar+="#"
+        /usr/bin/printf "[%-${progressionBarSize}s] %d%%\r" "${progressBar}${spaces:0:$((progressionBarSize - progress))}" "$(( (i * 100) / duration ))"
+        /usr/bin/sleep 1
+        progress=$((progress + step))
+    done
+    /usr/bin/echo # Ajouter une nouvelle ligne à la fin}
+}
+
+function restart_service(){
+# Cette fonction s'utilise avec un seul argument étant le nom du service
+# Si on ne donne l'argument "all", dans ce cas, elle redémarre tous les services de la suite ELK
+        if [ ! -z $1 ]
+        then
+                if [ $1 = "all" ]
+                then
+                        # Eteindre le service elasticsearch
+
+                        /usr/bin/systemctl stop elasticsearch.service
+                        /usr/bin/printf "$RED arrêt $NONE du service $PURPLE elasticsearch $NONE \n"
+                        progression_bar "5"
+
+                        # Eteindre le service kibana
+
+                        /usr/bin/systemctl stop kibana.service
+                        /usr/bin/printf "$RED arrêt $NONE du service kibana \n"
+                        progression_bar "5"
+
+
+                        # Eteindre le service filebeat
+
+                        /usr/bin/systemctl stop filebeat.service
+                        /usr/bin/printf "$RED arrêt $NONE du service filbeat \n"
+                        progression_bar "5"
+
+                        #_______________________________________________________
+                        # REDEMARRAGE DES SERVICES
+                        #_______________________________________________________
+                        /usr/bin/echo "redémarrage des services :"
+
+                        # DEMARRAGE du service elasticsearch
+
+                        /usr/bin/printf "$GREEN démarrage $NONE du service $PURPLE elasticsearch $NONE \n"
+                        /usr/bin/systemctl start elasticsearch.service
+                        progression_bar "15"
+
+
+                        # DEMARRAGE du service kibana
+
+                        /usr/bin/printf "$GREEN démarrage $NONE du service $PURPLE kibana $NONE \n"
+                        /usr/bin/systemctl start kibana.service
+                        progression_bar "15"
+
+                        # DEMARRAGE du service filebeat
+
+                        /usr/bin/printf "$GREEN démarrage $NONE du service $PURPLE filebeat $NONE \n"
+                        /usr/bin/systemctl start filebeat.service
+                        progression_bar "10"
+
+                        /usr/bin/printf "$BLUE VERIFICATION DE L'ETAT DES SERVICES $NONE \n"
+
+                        # VERIFICATION de l'état du service elasticsearch
+                        if /usr/bin/systemctl is-active --quiet "elasticsearch.service"
+                        then
+                                /usr/bin/printf "$CYAN Le service elasticsearch a bien démarré $NONE \n"
+                        else
+                                /usr/bin/printf "$RED une erreur est survenue lors du démarrage du service elasticsearch $NONE \n"
+                        fi
+                        /usr/bin/echo "état du service elasticsearch : "
+                        /usr/bin/systemctl is-active "elasticsearch.service"
+                        /usr/bin/sleep 2
+
+                        # VERIFICATION de l'état du service kibana
+                        if /usr/bin/systemctl is-active --quiet "kibana.service"
+                        then
+                                /usr/bin/printf "$CYAN le service kibana a bien démarré $NONE \n"
+                        else
+                                /usr/bin/printf "$CYAN une erreur est survenue lors du démarrage du service kibana $NONE \n"
+                        fi
+                        /usr/bin/echo "état du service kibana : "
+                        /usr/bin/systemctl is-active "kibana.service"
+                        /usr/bin/sleep 2
+
+
+                        # VERIFICATION de l'état du service filebeat
+                        if /usr/bin/systemctl is-active --quiet "filebeat.service"
+                        then
+                                /usr/bin/printf "$CYAN le service filebeat a bien démarré $NONE \n"
+                        else
+                                /usr/bin/printf "$CYAN une erreur est survenue lors du démarrage du service filebeat $NONE \n"
+                        fi
+                        /usr/bin/echo "état du service filebeat : "
+                        /usr/bin/systemctl is-active "filebeat.service"
+                        /usr/bin/sleep 2
+
+                fi
+                if [ $1 = "elastic" ]
+                then
+                        /usr/bin/printf "$RED arrêt $NONE du service $PURPLE elasticsearch $NONE en cour \n"
+                        /usr/bin/systemctl stop "elasticsearch.service"
+                        progression_bar "15"
+                        /usr/bin/printf "$GREEN redémarrage $NONE du service $PURPLE elasticsearch $NONE \n"
+                        /usr/bin/systemctl start "elasticsearch.service"
+                        progression_bar "10"
+                        if /usr/bin/systemctl is-active --quiet "elasticsearch.service"
+                        then
+                                /usr/bin/printf "$CYAN le service elasticsearch a bien démarré $NONE \n"
+                        else
+                                /usr/bin/printf "$RED une erreur est survenue lors du démarrage du service elasticsearch $NONE \n"
+                        fi
+                        /usr/bin/echo "état du service elastic : "
+                        /usr/bin/systemctl is-active "elasticsearch.service"
+                        /usr/bin/sleep 2
+
+
+
+                fi
+                if [ $1 = "kibana" ]
+                then
+                        /usr/bin/printf "$RED arrêt $NONE du service $PURPLE kibana $NONE en cour \n"
+                        /usr/bin/systemctl stop "kibana.service"
+                        progression_bar "15"
+                        /usr/bin/printf "$BLUE redémarrage $NONE du service kibana \n"
+                        /usr/bin/systemctl start "kibana.service"
+                        progression_bar "20"
+                        if /usr/bin/systemctl is-active --quiet "kibana.service"
+                        then
+                                /usr/bin/printf "$CYAN le service kibana a bien démarré $NONE \n"
+                        else
+                                /usr/bin/printf "$CYAN une erreur est survenue lors du démarrage du service kibana $NONE \n"
+                        fi
+                        /usr/bin/echo "état du service kibana : "
+                        /usr/bin/systemctl is-active "kibana.service"
+                        /usr/bin/sleep 2
+
+
+
+                fi
+                if [ $1 = "filebeat" ]
+                then
+                        /usr/bin/printf "$RED arrêt $NONE du service $PURPLE filebeat $NONE en cour \n"
+                        /usr/bin/systemctl stop "filebeat.service"
+                        progression_bar "15"
+                        /usr/bin/printf "$BLUE redémarrage $NONE du service filebeat\n"
+                        /usr/bin/systemctl start "filebeat.service"
+                        progression_bar "20"
+                        if /usr/bin/systemctl is-active --quiet "filebeat.service"
+                        then
+                                /usr/bin/printf "$CYAN le service filebeat a bien démarré $NONE \n"
+                        else
+                                /usr/bin/printf "$RED une erreur est survenue lors du démarrage du service filebeat $NONE \n"
+                        fi
+                        /usr/bin/echo "état du service filebeat : "
+                        /usr/bin/systemctl is-active "filebeat.service"
+                        /usr/bin/sleep 2
+                fi
+        else
+                /usr/bin/echo "veuillez donner le nom du service que vous voulez redémarrer"
+        fi
+}
+
+
+function stop_service () {
+#Cette fonction permet d'arrêter des services. Il suffit de lui donner le nom du service en question
+        if [ ! -z $1 ]
+        then
+                if [ $1 = "all" ]
+                then
+                        /usr/bin/printf "$RED arrêt $NONE du service $PURPLE elasticsearch $NONE \n"
+                        /usr/bin/systemctl stop elasticsearch.service
+                        progression_bar "10"
+
+                        /usr/bin/printf "$RED arrêt $NONE du service $PURPLE kibana $NONE \n"
+                        /usr/bin/systemctl stop kibana.service
+                        progression_bar "10"
+
+                        /usr/bin/printf "$RED arrêt $NONE du service $PURPLE filebeat $NONE \n"
+                        /usr/bin/systemctl stop filebeat.service
+                        progression_bar "5"
+
+                        /usr/bin/printf "$BLUE VERIFICATION DE L'ETAT DES SERVICES $NONE \n"
+                        /usr/bin/printf "Etat du service $PURPLE elasticsearch $NONE :\n"
+                        /usr/bin/systemctl is-active elasticsearch.service
+
+                        /usr/bin/printf "Etat du service $PURPLE kibana $NONE : \n"
+                        /usr/bin/systemctl is-active kibana.service
+
+                        /usr/bin/printf "Etat du service $PURPLE filebeat $NONE : \n"
+                        /usr/bin/systemctl is-active filebeat.service
+                fi
+                if [ $1 = "elasticsearch" ]
+                then
+                        /usr/bin/printf "$RED arrêt $NONE du service $PURPLE elasticsearch $NONE \n"
+                        /usr/bin/systemctl stop elasticsearch.service
+                        progression_bar "10"
+
+                        /usr/bin/printf "$BLUE VERIFICATION DE L'ETAT DU SERVICE $NONE \n"
+                        /usr/bin/printf "Etat du service $PURPLE elasticsearch $NONE :\n"
+                        /usr/bin/systemctl is-active elasticsearch.service
+
+                fi
+                if [ $1 = "kibana" ]
+                then
+                        /usr/bin/printf "$RED arrêt $NONE du service $PURPLE kibana $NONE \n"
+                        /usr/bin/systemctl stop kibana.service
+                        progression_bar "10"
+
+                        /usr/bin/printf "$BLUE VERIFICATION DE L'ETAT DU SERVICE $NONE \n"
+                        /usr/bin/printf "Etat du service $PURPLE kibana $NONE :\n"
+                        /usr/bin/systemctl is-active kibana.service
+
+                fi
+                if [ $1 = "filebeat" ]
+                then
+                        /usr/bin/printf "$RED arrêt $NONE du service $PURPLE filebeat $NONE \n"
+                        /usr/bin/systemctl stop filebeat.service
+                        progression_bar "10"
+
+                        /usr/bin/printf "$BLUE VERIFICATION DE L'ETAT DU SERVICE $NONE \n"
+                        /usr/bin/printf "Etat du service $PURPLE filebeat $NONE :\n"
+                        /usr/bin/systemctl is-active filebeat.service
+
+                fi
+        else
+                /usr/bin/printf "$RED Veuillez donner au moins service à arrêter $NONE\n"
+        fi
+}
+
+function start_service () {
+# cette fonction a pour but de démarrer les services
+        if [ ! -z $1 ]
+        then
+                if [ $1 = "all" ]
+                then
+                        /usr/bin/printf "$BLUE DEMARRAGE DE TOUS LES SERVICES $NONE \n"
+                        /usr/bin/printf "$GREEN Démarrage $NONE du service $PURPLE elasticsearch $NONE \n"
+                        /usr/bin/systemctl start elasticsearch.service
+                        progression_bar "20"
+
+                        /usr/bin/printf "$GREEN Démarrage $NONE du service $PURPLE kibana $NONE \n"
+                        /usr/bin/systemctl start kibana.service
+                        progression_bar "15"
+
+                        /usr/bin/printf "$GREEN Démarrage $NONE du service $PURPLE filebeat $NONE \n"
+                        progression_bar "10"
+
+                        /usr/bin/printf "$BLUE VERIFICATION DE L'ETAT DES SERVICES $NONE \n"
+                        /usr/bin/printf "Etat du service $PURPLE elasticsearch $NONE \n"
+                        /usr/bin/systemctl is-active elasticsearch.service
+
+                        /usr/bin/printf "Etat du service $PURPLE kibana $NONE \n"
+                        /usr/bin/systemctl is-active kibana.service
+
+                        /usr/bin/printf "Etat du service $PURPLE filebeat $NONE \n"
+                        /usr/bin/systemctl is-active filebeat.service
+                fi
+                if [ $1 = "elasticsearch" ]
+                then
+                        /usr/bin/printf "$GREEN Démarrage $NONE du service $PURPLE elasticsearch $NONE \n"
+                        /usr/bin/systemctl start elasticsearch.service
+                        progression_bar "15"
+
+                        /usr/bin/printf "$BLUE Etat du service : $NONE \n"
+                        /usr/bin/systemctl is-active elasticsearch.service
+                fi
+                if [ $1 = "kibana" ]
+                then
+                        /usr/bin/printf "$GREEN Démarrage du service $PURPLE kibana $NONE \n"
+                        /usr/bin/systemctl start kibana.service
+                        progression_bar "15"
+
+                        /usr/bin/printf "$BLUE Etat du service : $NONE \n"
+                        /usr/bin/systemctl is-active kibana.service
+                fi
+                if [ $1 = "filebeat" ]
+                then
+                        /usr/bin/printf "$GREEN Démarrage $NONE du service $PURPLE filebeat $NONE \n"
+                        /usr/bin/systemctl start filebeat.service
+                        progression_bar "10"
+
+                        /usr/bin/printf "$BLUE Etat du service : $NONE \n"
+                        /usr/bin/systemctl is-active filebeat.service
+                fi
+        else
+                /usr/bin/printf "$RED veuillez donner le nom d'un service à démarrer $NONE\n"
+        fi
+}
+
+function display_help () {
+# Fonction utilisée pour afficher l'aide d'utilisation de cet outil
+        /usr/bin/echo "Vous pouvez utiliser les arguments suivants : "
+        /usr/bin/printf "    $CYAN -h $NONE : Affiche cette aide"
+        /usr/bin/echo ""
+        /usr/bin/printf "    $CYAN restart $NONE : pour redémarrer les services elastic sur le serveur (kibana, elasticserch, filebeat) \n        $LIGHT_GREEN Exemple : $NONE elkmaster restart \n"
+        /usr/bin/echo ""
+        /usr/bin/printf "        $CYAN restart $NONE [nom du service] pour redémarrer un service spécifique \n"
+        /usr/bin/printf "        les services disponible sont : $PURPLE kibana, filebeat, elasticsearch $NONE \n            $LIGHT_GREEN Exemple : $NONE elkmaster restart elasticsearch pour redémarrer uniquement le service elasticsearch \n\n"
+        /usr/bin/echo ""
+        /usr/bin/printf "    $CYAN stop $NONE : pour $RED arrêter $NONE tous les services $PURPLE elastic $NONE sur le serveur \n"
+        /usr/bin/echo "        stop [nom du service] pour arrêter un service spécifique"
+        /usr/bin/printf "        les services disponibles sont : $PURPLE kibana, filebeat, elasticsearch $NONE \n\n"
+        /usr/bin/echo ""
+        /usr/bin/printf "    $CYAN start $NONE : pour $GREEN démarrer $NONE tous les services $PURPLE elastic $NONE sur le serveur \n"
+        /usr/bin/printf "        $CYAN start $NONE [nom du service] pour arrêter un service spécifique \n"
+        /usr/bin/printf "        les services disponibles sont : $PURPLE kibana, filebeat, elasticsearch $NONE \n\n"
+        /usr/bin/printf "    $CYAN edit $NONE : $RED nécessite les droits sudo $NONE permet d'éditer les fichiers de configuration des différents services en créant automatiquement un $GREEN backup $NONE du fichier avant modification\n"
+        /usr/bin/printf "        $CYAN edit $NONE [nom du service] pour éditer le fichier de configuration d'un service et créer une sauvegarde dans $GREEN /home/public/.elkmaster $NONE\n\n"
+        /usr/bin/printf "    $CYAN restore $NONE : pour $GREEN restaurer $NONE le fichier de configuration d'un service.\n"
+        /usr/bin/printf "        $CYAN restore $NONE [nom du service] : $RED Obligatoire $NONE pour restaurer le fichier voulu. Suivre les consignes pour restaurer le bon fichier par la suite.\n"
+}
+
+function give_status () {
+# Cette fonction est utilisée pour afficher le statut des services ELK
+        if [ ! -z $1 ]
+        then
+                if [ $1 = "all" ]
+                then
+                        /usr/bin/printf "$BLUE _________________________________________________ $NONE \n"
+                        /usr/bin/printf "$BLUE AFFICHAGE DES STATUS DES SERVICES $NONE \n"
+                        /usr/bin/printf "$BLUE _________________________________________________ $NONE \n\n\n"
+
+                        /usr/bin/printf "Statut du service $PURPLE elasticsearch $NONE : \n"
+                        /usr/bin/systemctl is-active elasticsearch.service
+                        /usr/bin/systemctl status elasticsearch.service --no-pager
+                        /usr/bin/printf "\n\n"
+
+                        /usr/bin/printf "Statut du service $PURPLE kibana $NONE : \n"
+                        /usr/bin/systemctl is-active kibana.service
+                        /usr/bin/systemctl status kibana.service --no-pager
+                        /usr/bin/printf "\n\n"
+
+                        /usr/bin/printf "Statut du service $PURPLE filebeat $NONE : \n"
+                        /usr/bin/systemctl is-active filebeat.service
+                        /usr/bin/systemctl status filebeat.service --no-pager
+                        /usr/bin/printf "\n\n"
+                fi
+                if [ $1 = "elastic" ]
+                then
+                        /usr/bin/printf "$BLUE _________________________________________________ $NONE \n"
+                        /usr/bin/printf "$BLUE AFFICHAGE DU STATUS D'ELASTIC $NONE \n"
+                        /usr/bin/printf "$BLUE _________________________________________________ $NONE \n\n\n"
+
+                        /usr/bin/printf "Statut du service $PURPLE elasticsearch $NONE : \n"
+                        /usr/bin/systemctl is-active elasticsearch.service
+                        /usr/bin/systemctl status elasticsearch.service --no-pager
+                        /usr/bin/printf "\n\n"
+                fi
+                if [ $1 = "kibana" ]
+                then
+                        /usr/bin/printf "$BLUE _________________________________________________ $NONE \n"
+                        /usr/bin/printf "$BLUE AFFICHAGE DU STATUS DE KIBANA $NONE \n"
+                        /usr/bin/printf "$BLUE _________________________________________________ $NONE \n\n\n"
+
+                        /usr/bin/printf "Statut du service $PURPLE kibana $NONE : \n"
+                        /usr/bin/systemctl is-active kibana.service
+                        /usr/bin/systemctl status kibana.service --no-pager
+                        /usr/bin/printf "\n\n"
+                fi
+                if [ $1 = "filebeat" ]
+                then
+                        /usr/bin/printf "$BLUE _________________________________________________ $NONE \n"
+                        /usr/bin/printf "$BLUE AFFICHAGE DU STATUS DE FILEBEAT $NONE \n"
+                        /usr/bin/printf "$BLUE _________________________________________________ $NONE \n\n\n"
+
+                        /usr/bin/printf "Statut du service $PURPLE filebeat $NONE : \n"
+                        /usr/bin/systemctl is-active filebeat.service
+                        /usr/bin/systemctl status filebeat.service --no-pager
+                        /usr/bin/printf "\n\n"
+                fi
+        else
+                /usr/bin/printf "$RED Veuillez donner au moins un argument dans cette fonction $NONE\n"
+        fi
+}
+
+function edit_config () {
+# Cette fonction est utilisée pour éditer la configuration des services de la suite ELK. Le but est de pouvoir avoir automatiquement un backup du fichier avatn de l'éditer
+# l'objectif est donc de limiter la casse si on s'est platé dans la configuration
+        if [ $1 = "elastic" ]
+        then
+                if [ ! -d /home/public/.elkmaster/ ]
+                then
+                        # Vérifier si le dossier existe, et le créer sinon
+                        /usr/bin/mkdir /home/public/.elkmaster/elastic # dossier utilisé pour sauvegarder la config au cas où on s'est planté
+                fi
+                filename=$(get_date)
+                del_old_file "elastic"
+                /usr/bin/cp /etc/elasticsearch/elasticsearch.yml /home/public/.elkmaster/elastic/elasticsearch.$filename.yml.bak
+                /usr/bin/micro /etc/elasticsearch/elasticsearch.yml
+        fi
+        if [ $1 = "kibana" ]
+        then
+                if [ ! -d /home/public/.elkmaster ]
+                then
+                        # Vérifier si le dossier existe, et le créer sinon
+                        /usr/bin/mkdir /home/public/.elkmaster/kibana
+                fi
+                filename=$(get_date)
+                del_old_file "kibana"
+                /usr/bin/cp /etc/kibana/kibana.yml /home/public/.elkmaster/kibana/kibana.$filename.yml.bak
+                /usr/bin/micro /etc/kibana/kibana.yml
+        fi
+        if [ $1 = "filebeat" ]
+        then
+                if [ ! -d /home/public/.elkmaster ]
+                then
+                        # Vérifier si le dossier existe, et le créer sinon
+                        /usr/bin/mkdir /home/public/.elkmaster/filebeat
+                fi
+                filename=$(get_date)
+                del_old_file "filebeat"
+                /usr/bin/cp /etc/filebeat/filebeat.yml /home/public/.elkmaster/filebeat/filebeat.$filename.yml.bak
+                /usr/bin/micro /etc/filebeat/filebeat.yml
+        fi
+
+}
+
+function get_date () {
+# Fonction utilisée pour récupérer la date actuelle
+        now=$(date +%s) # récupérer le timestamp depuis le 1er janvier 1980
+        /usr/bin/echo $now # renvoyer la variable pour qu'elle puisse être utillisée dans la fonction qui l'appelle
+}
+
+function del_old_file() {
+    # Fonction utilisée pour supprimer les archives trop anciennes dans le dossier où on est
+    fileType=$1 # Récupérer le nom du service que l'on souhaite récupérer
+
+    # Trouver le chemin en fonction du type de fichier que l'on a
+    if [ $fileType = "elastic" ]; then
+        path="/home/public/.elkmaster/elastic/"
+    elif [ $fileType = "kibana" ]; then
+        path="/home/public/.elkmaster/kibana/"
+    elif [ $fileType = "filebeat" ]; then
+        path="/home/public/.elkmaster/filebeat/"
+    else
+        /usr/bin/echo "Type de fichier invalide."
+        return
+    fi
+
+    # Lister les fichiers que l'on a dans le dossier
+    fileList=$(ls "$path")
+
+    # Stocker les noms de fichiers dans un tableau
+    IFS=$'\n' read -d '' -ra filenames <<< "$fileList"
+
+    # Vérifier si nous avons au moins 5 fichiers
+    if [ ${#filenames[@]} -ge 10 ]; then
+        # Trier les noms de fichiers par ordre alphabétique (le plus ancien en premier)
+        sorted_filenames=($(/usr/bin/printf "%s\n" "${filenames[@]}" | sort))
+
+        # Récupérer le nom du fichier le plus ancien
+        oldest_filename="${sorted_filenames[0]}"
+        `/usr/bin/rm $path$oldest_filename`
+        /usr/bin/printf "fichier de sauvegarde $RED supprimé $NONE : $path$oldest_filename\n"
+    else
+        /usr/bin/echo "Il n'y a pas assez de fichiers dans l'archive pour supprimer le plus ancien"
+    fi
+}
+
+function restore_file() {
+    # Fonction utilisée pour restaurer les fichiers de configuration d'un service voulu
+    # La fonction utilise les fichiers de conf sauvegardés dans /home/public/.elkmaster/[service_name]
+
+    #################### UTILISATION DE LA FONCTION #####################
+    # Mettre dans le premier argument de la fonction le nom du service qui est concerné.
+    fileType=$1 # On récupère le nom du service
+
+    # Trouver le chemin en fonction du type de fichier que l'on a
+    if [ $fileType = "elastic" ]; then
+        path=$ELASTIC_SAVE_PATH
+                folder="elasticsearch"
+    elif [ $fileType = "kibana" ]; then
+        path=$KIBANA_SAVE_PATH
+                folder="kibana"
+    elif [ $fileType = "filebeat" ]; then
+        path=$FILEBEAT_SAVE_PATH
+                folder="filebeat"
+    else
+        /usr/bin/printf "$RED Type de fichier invalide. $NONE"
+        return
+    fi
+
+    # Lister les fichiers que l'on a dans le dossier :
+    fileList=$(ls "$path")
+
+    # Stocker les noms de fichiers dans un tableau
+    IFS=$'\n' read -d '' -ra filenames <<< "$fileList"
+
+    # Maintenant on trie chaque élément de ce fichier
+    sorted_filenames=($(/usr/bin/printf "%s\n" "${filenames[@]}" | sort -r)) # Faire en sorte que la modification la plus récente s'affiche en haut
+
+    # Afficher les fichiers avec la date de dernière modification
+    for ((i=0; i<${#sorted_filenames[@]}; i++)); do
+        filename="${sorted_filenames[$i]}"
+        # Extraire le timestamp du nom de fichier
+        timestamp=$(/usr/bin/echo "$filename" | grep -oP '\d+')
+        # Convertir le timestamp en date lisible
+        mod_date=$(date -d @$timestamp +"%Y-%m-%d %H:%M:%S")
+        /usr/bin/printf "$((i+1)) ) $filename ($BLUE modifié le$NONE$PURPLE $mod_date $NONE)\n"
+    done
+
+    /usr/bin/echo "Veuillez choisir le fichier à restaurer"
+    read file_to_restore # Stocker la réponse de l'utilisateur dans une variable
+
+    
+
+    /usr/bin/printf "Veuillez choisir $GREEN l'action $NONEà réaliser :\n"
+    /usr/bin/printf "    1 : déplacer le fichier restauré dans /etc/$folder/ (il vous faudra donc $RED renommer $NONE le fichier et $RED redémarrer $NONE le service concerné).\n" 
+    /usr/bin/printf "    2 : laisser le script $RED supprimer $NONE l'ancien fichier, $RED déplacer $NONE le fichier à restaurer, le $RED renommer $NONE et $RED redémarrer $NONE le service\n"
+    read restore_choice
+
+    if [ $restore_choice = "1" ]
+    then
+        # Faire uniquement une copie du fichier concerné sans action supplémentaire.
+        selected_file="${sorted_filenames[$((file_to_restore-1))]}"
+        /usr/bin/cp "$path$selected_file" "/etc/$folder/$selected_file"
+        /usr/bin/echo "Le fichier $selected_file a été restauré." 
+    fi
+    if [ $restore_choice = "2" ]
+    then
+        selected_file="${sorted_filenames[$((file_to_restore-1))]}"
+        /usr/bin/cp "$path$selected_file" "/etc/$folder/$selected_file"
+        /usr/bin/sleep 1
+        /usr/bin/printf "Le fichier $selected_file a été $GREEN copié $NONE ici : /etc/$folder/\n"
+        /usr/bin/sleep 1
+        /usr/bin/rm "/etc/$folder/$folder.yml"
+        /usr/bin/printf "le fichier de configuration précédent a été $RED supprimé $NONE \n"
+        /usr/bin/sleep 1
+        /usr/bin/mv "/etc/$folder/$selected_file" "/etc/$folder/$folder.yml"
+        /usr/bin/printf "Le fichier restauré a été $GREEN renommé en $folder.yml $NONE \n"
+        /usr/bin/sleep 1
+        /usr/bin/printf "$BLUE redémarrage du service $folder en cour $NONE \n"
+        restart_service "$folder"
+    fi
+
+}
+
+
+function test () {
+# simplement utilisé pour tester les fonctions à ajouter dans l'outil.
+        progression_bar 5
+}
+
+# Utilisation de la fonction
+
+###########################################################
+# DECLARATION DU CODE LOGIQUE (pas si logique que ça mais bon...)
+###########################################################
+
+if [ ! -z $1 ]
+then
+        if [ $1 = "restore" ]
+        then
+        # Condition permettant de rstaurer un fichier de configuration d'un service.
+                if [ ! -z $2 ]
+                then
+                        if [ $2 = "elastic" ]
+                        then
+                                /usr/bin/printf "$LIGHT_GREEN Restoration du fichier d'$2 en cour$NONE\n"
+                                restore_file $2
+                        fi
+                        if [ $2 = "elasticsearch" ]
+                        then
+                                /usr/bin/printf "$LIGHT_GREEN Restoration du fichier d'$2 en cour$NONE\n"
+                                restore_file "elastic"
+                        fi
+                        if [ $2 = "kibana" ]
+                        then
+                                /usr/bin/printf "$LIGHT_GREEN Restoration du fichier de $2 en cour$NONE\n"
+                                restore_file $2
+                        fi
+                        if [ $2 = "filebeat" ]
+                        then
+                                /usr/bin/printf "$LIGHT_GREEN Restoration du fichier de $2 en cour$NONE\n"
+                                restore_file $2
+                        fi
+                else
+                        /usr/bin/printf "$RED Veuillez donner le nom du service pour restaurer sa configuration $NONE\n"
+                        display_help
+                fi
+        fi
+        if [ $1 = "restart" ]
+        then
+        ######################################################
+      	#	 Condition permettant de redémarrer un service 	 #
+        ######################################################
+                if [ ! -z $2 ]
+                then
+                        if [ $2 = "elasticsearch" ]
+                        then
+                                /usr/bin/echo "redémarrage du service elasticsearch"
+                                restart_service $2
+                        fi
+                        if [ $2 = "kibana" ]
+                        then
+                                /usr/bin/echo "redémarrage du service kibana"
+                                restart_service $2
+                        fi
+                        if [ $2 = "filebeat" ]
+                        then
+                                /usr/bin/echo "redémarrage du service filebeat"
+                                restart_service $2
+                        fi
+                else
+
+                restart_service "all"
+                fi
+        fi
+        if [ $1 = "stop" ]
+        then
+        ######################################################
+      	#	 Condition permettant d'arrêter un service  	 #
+        ######################################################
+                if [ ! -z $2 ]
+                then
+                        if [ $2 = "elasticsearch" ]
+                        then
+                                stop_service "elasticsearch"
+                        fi
+                        if [ $2 = "kibana" ]
+                        then
+                                stop_service "kibana"
+                        fi
+                        if [ $2 = "filebeat" ]
+                        then
+                                stop_service "filebeat"
+                        fi
+                else
+
+
+                stop_service "all"
+                fi
+
+        fi
+        if [ $1 = "start" ]
+        then
+        ###################################################################
+        #	 Condition permettant de démarrer un ou plusieurs services.   #
+        ###################################################################
+                if [ ! -z $2 ]
+                then
+                        if [ $2 = "elastic" ]
+                        then
+                                start_service "elasticsearch"
+                        fi
+                        if [ $2 = "kibana" ]
+                        then
+                                start_service "kibana"
+                        fi
+                        if [ $2 = "filebeat" ]
+                        then
+                                start_service "filebeat"
+                        fi
+                else
+                        start_service "all"
+                fi
+
+        fi
+        if [ $1 = "status" ]
+        then
+        # Condition permettant d'afficher le statut d'un ou plusieurs services
+                if [ ! -z $2 ]
+                then
+                        if [ $2 = "elasticsearch" ]
+                        then
+                                give_status "elastic"
+                        fi
+                        if [ $2 = "kibana" ]
+                        then
+                                give_status "kibana"
+                        fi
+                        if [ $2 = "filebeat" ]
+                        then
+                                give_status "filebeat"
+                        fi
+                else
+                        give_status "all"
+                fi
+        fi
+        if [ $1 = "edit" ]
+        then
+        # Condition permettant d'éditer les fichiers de configuration des services. Il permet également de faire des sauvegardes des fichiers avant de les éditer.
+                if [ ! -z $2 ]
+                then
+                        if [ $2 = "elasticsearch" ]
+                        then
+                                edit_config "elastic"
+                        fi
+                        if [ $2 = "kibana" ]
+                        then
+                                edit_config "kibana"
+                        fi
+                        if [ $2 = "filebeat" ]
+                        then
+                                edit_config "filebeat"
+                        fi
+                else
+                        /usr/bin/printf "veuillez donner le nom d'un service pour éditer sa $BLUE configuration $NONE\n"
+                fi
+        fi
+		if [ $1 = "update" ]
+        then
+		# Condition premettant de mettre à jour le serveur et principalement de mettre à jour les paquets d'elastic
+                if [ ! -z $2 ]
+                then
+                        if [ $2 = "elasticsearch" ]
+                        then
+								fprintf "mise à jour du service ${PURPLE}elasticsearch ${NONE}, veuillez suivre les consignes \n"                        	
+                                update_services "elastic"
+                        fi
+                        if [ $2 = "kibana" ]
+                        then
+                        		fprintf "mise à jour du service ${PURPLE}kibana ${NONE}, veuillez suivre les consignes suivantes \n"  
+                                update_services "kibana"
+                        fi
+                        if [ $2 = "filebeat" ]
+                        then
+                        		fprintf "mise à jour du service ${PURPLE}filebeat ${NONE}, veuillez suivre les consignes suivantes\n"  
+                                update_services "filebeat"
+                        fi
+                else
+                		fprintf "mise à jour du ${BLUE}serveur complet${NONE}, veuillez suivre les consignes suivantes\n"  
+                        update_services "all"
+                fi
+        fi		
+        if [ $1 = "-h" ]
+        then
+                display_help
+        fi
+        if [ $1 = "test" ]
+        # Condition permettant de tester les nouvelles fonctionnalités à coder.
+        then
+                restore_file "elastic"
+        fi
+else
+        /usr/bin/printf "$RED Veuillez donner au minimum un argument avec cet outil $NONE \nVeuillez vous référer à l'aide ci-dessous ou au manuel : \n\n"
+        display_help
+fi
+
